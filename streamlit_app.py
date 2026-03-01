@@ -159,7 +159,10 @@ CHART_LAYOUT_DEFAULTS = dict(
     paper_bgcolor=T['plotly_paper'],
     plot_bgcolor=T['plotly_plot'],
     font=dict(color=T['plotly_font'], size=11, family='Inter'),
-    xaxis=dict(showgrid=False),
+    xaxis=dict(
+        showgrid=False,
+        type='date'  # 🚨 Explicitly tell Plotly this is a continuous timeline
+    ),
     yaxis=dict(gridcolor=T['plotly_grid'], tickformat="g"),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
     margin=dict(t=40, b=50, l=10, r=10),
@@ -180,14 +183,20 @@ def to_csv(df: pd.DataFrame) -> bytes:
 
 
 def process_timestamps(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert DS3231 column to Asia/Bangkok local time."""
+    """Convert DS3231 column to local time and strip timezone for Plotly compatibility."""
     df = df.copy()
+    
+    # 🚨 Convert to UTC, then to Bangkok, then STRIP the timezone info
     df['local_time'] = (
         pd.to_datetime(df['DS3231'], errors='coerce')
         .dt.tz_localize('UTC')
         .dt.tz_convert('Asia/Bangkok')
+        .dt.tz_localize(None) 
     )
+    
     df.dropna(subset=['local_time'], inplace=True)
+    df.sort_values(by='local_time', ascending=True, inplace=True, ignore_index=True)
+    
     return df
 
 
@@ -239,14 +248,21 @@ with st.spinner("Loading sensor data…"):
 station1 = process_timestamps(raw_s1)
 station2 = process_timestamps(raw_s2)
 
-start_dt = pd.to_datetime(f"{selected_date} {selected_time}").tz_localize('Asia/Bangkok')
+# 🚨 No timezone localizing here, as the dataframe is now tz-naive
+start_dt = pd.to_datetime(f"{selected_date} {selected_time}")
+
 filt1 = station1[station1['local_time'] >= start_dt].copy()
 filt2 = station2[station2['local_time'] >= start_dt].copy()
 
 if enable_end and selected_end_date and selected_end_time:
-    end_dt = pd.to_datetime(f"{selected_end_date} {selected_end_time}").tz_localize('Asia/Bangkok')
+    # 🚨 No timezone localizing here either
+    end_dt = pd.to_datetime(f"{selected_end_date} {selected_end_time}")
     filt1 = filt1[filt1['local_time'] <= end_dt]
     filt2 = filt2[filt2['local_time'] <= end_dt]
+
+# Final sorting after filtering to ensure downloads are strictly ordered
+filt1.sort_values(by='local_time', ascending=True, inplace=True, ignore_index=True)
+filt2.sort_values(by='local_time', ascending=True, inplace=True, ignore_index=True)
 
 
 # ─── Compute latest datapoint timestamp ────────────────────────────────────────
@@ -288,16 +304,6 @@ st.markdown(
 
 # ─── Plotting Functions ─────────────────────────────────────────────────────────
 def create_box_plot(df1: pd.DataFrame, df2: pd.DataFrame) -> go.Figure:
-    """
-    Create box plots where each box at a given timestamp is computed from the
-    10 sub-sensor readings (e.g. KIT1-1 through KIT1-10).
-
-    Result: 4 box plot groups per timestamp:
-      - KIT1 · S1  (KIT1-1 … KIT1-10 from Station 1)
-      - KIT2 · S1  (KIT2-1 … KIT2-10 from Station 1)
-      - KIT1 · S2  (KIT1-1 … KIT1-10 from Station 2)
-      - KIT2 · S2  (KIT2-1 … KIT2-10 from Station 2)
-    """
     fig = go.Figure()
 
     kit1_cols = [f'KIT1-{i}' for i in range(1, 11)]
@@ -317,8 +323,6 @@ def create_box_plot(df1: pd.DataFrame, df2: pd.DataFrame) -> go.Figure:
         if not available or df_src.empty:
             continue
 
-        # Melt the 10 sub-sensor columns into long format so each timestamp
-        # has up to 10 values → enough for a real box with Q1, median, Q3
         melted = df_src[['local_time'] + available].melt(
             id_vars='local_time', value_vars=available,
             var_name='sub_sensor', value_name='value'
@@ -327,23 +331,26 @@ def create_box_plot(df1: pd.DataFrame, df2: pd.DataFrame) -> go.Figure:
         if melted.empty:
             continue
 
-        # Pre-compute stats per timestamp for explicit box rendering
         grouped = melted.groupby('local_time')['value']
         stats = grouped.agg(['median', 'count']).reset_index()
         q1 = grouped.quantile(0.25).reset_index(name='q1')
         q3 = grouped.quantile(0.75).reset_index(name='q3')
+        
         stats = stats.merge(q1, on='local_time').merge(q3, on='local_time')
         stats['iqr'] = stats['q3'] - stats['q1']
         stats['lower_fence'] = stats['q1'] - 1.5 * stats['iqr']
         stats['upper_fence'] = stats['q3'] + 1.5 * stats['iqr']
-        # Clamp fences to actual observed min/max per timestamp
+        
         bin_mins = grouped.min().reset_index(name='vmin')
         bin_maxs = grouped.max().reset_index(name='vmax')
         stats = stats.merge(bin_mins, on='local_time').merge(bin_maxs, on='local_time')
+        
         stats['lower_fence'] = stats[['lower_fence', 'vmin']].max(axis=1)
         stats['upper_fence'] = stats[['upper_fence', 'vmax']].min(axis=1)
 
-        # ── Box trace with explicit statistics ──
+        # 🚨 Explicitly sort again after all the merges to prevent visual zig-zags
+        stats.sort_values('local_time', ascending=True, inplace=True, ignore_index=True)
+
         fig.add_trace(go.Box(
             x=stats['local_time'],
             lowerfence=stats['lower_fence'],
@@ -361,7 +368,6 @@ def create_box_plot(df1: pd.DataFrame, df2: pd.DataFrame) -> go.Figure:
             visible=False,
         ))
 
-        # ── Line trace (median over time) ──
         fig.add_trace(go.Scatter(
             x=stats['local_time'],
             y=stats['median'],
@@ -407,16 +413,19 @@ def create_box_plot(df1: pd.DataFrame, df2: pd.DataFrame) -> go.Figure:
 
 
 def create_temperature_chart(df1: pd.DataFrame, df2: pd.DataFrame) -> go.Figure:
-    """Create a clean temperature comparison line chart."""
     fig = go.Figure()
     temp_col = 'DS18B20 Temperature (°C)'
 
     for df, name, color in [(df1, 'Station 1', COLORS['S1']), (df2, 'Station 2', COLORS['S2'])]:
         if temp_col not in df.columns:
             continue
-        valid = df.dropna(subset=[temp_col, 'local_time'])
+        valid = df.dropna(subset=[temp_col, 'local_time']).copy()
         if valid.empty:
             continue
+            
+        # 🚨 Ensure valid data is sorted before plotting
+        valid.sort_values('local_time', ascending=True, inplace=True, ignore_index=True)
+        
         fig.add_trace(go.Scatter(
             x=valid['local_time'],
             y=valid[temp_col],
